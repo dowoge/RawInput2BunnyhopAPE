@@ -38,3 +38,52 @@ It should be possible to fix `Map differs` errors when you download from the ser
 ### Cloning & building
 - `git clone --recurse-submodules https://github.com/rtldg/RawInput2BunnyhopAPE.git`
 - Then just build it with Visual Studio 2022+ haha!
+
+### Linux
+
+The `linux/` directory ships a 64-bit Linux port of just the `m_rawinput 2`
+mouse interpolation. No autohop (the game has it natively now), no viewpunch
+remover, no fastdl. Modern CS:S on Linux runs `cstrike_linux64`, which is what the
+preload targets.
+
+The Linux client has no `m_rawinput 2` code path at all: the cvar is only
+ever tested against `0`, and the engine pumps mouse input once per render
+frame, so every tick of a multi-tick frame sees the same lump of motion. The
+port detours `CInput::GetAccumulatedMouseDeltasAndResetAccumulators` in
+`client.so` and hooks three `CInput` vtable entries (`IN_SetSampleTime`,
+`CreateMove`, `ExtraMouseSample`) to get the engine's own frametimes, then
+splits an SDL-event-watch accumulator across ticks the same way momentum
+does -- each tick gets exactly its `interval_per_tick` worth of motion
+whether the game runs at 30 fps or 500 fps.
+
+**Build:**
+
+```sh
+cd linux
+make
+```
+
+Produces `librawinput2_linux.so` (the LD_PRELOAD payload) and
+`RawInput2BunnyhopAPE` (a tiny CLI that prints the launch-options string).
+
+**Run:**
+
+```sh
+./RawInput2BunnyhopAPE
+```
+
+It detects your CS:S install via `libraryfolders.vdf` and prints the exact
+Steam launch-options string. Paste it into Steam → Counter-Strike: Source →
+Properties → Launch Options. It looks like:
+
+```
+LD_PRELOAD="/abs/path/to/librawinput2_linux.so" %command% -insecure
+```
+
+The interpolation is on whenever the preload is loaded -- there's no in-game
+toggle. To disable, remove the `LD_PRELOAD=...` portion from your launch
+options.
+
+**VAC warning:** `-insecure` is mandatory. Joining a VAC-secured server with
+the preload loaded will earn you a VAC ban. Only join servers the in-game
+browser shows as insecure.
