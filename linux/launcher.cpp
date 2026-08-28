@@ -95,6 +95,7 @@ int main()
 	printf("RawInput2BunnyhopAPE -- Linux port\n");
 	printf("==================================\n\n");
 	printf("m_rawinput 2 mouse interpolation (always on)\n");
+	printf("F7 toggles the viewpunch remover (on by default)\n");
 	printf("download progress shown in the loading bar\n\n");
 
 	if (!path_exists(so_path)) {

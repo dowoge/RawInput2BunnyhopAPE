@@ -1,8 +1,9 @@
 // LD_PRELOAD payload for 64-bit CS:S on Linux: m_rawinput 2 mouse
-// interpolation and download progress. Always on; disable by removing
-// LD_PRELOAD from the launch options.
+// interpolation, download progress, viewpunch remover. Always on; disable by
+// removing LD_PRELOAD from the launch options.
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -34,8 +35,37 @@ static double plat_now()
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+typedef void (*ConMsg_t)(const char* fmt, ...);
+static ConMsg_t g_ConMsg = nullptr;
+
+static void conmsg(const char* fmt, ...)
+{
+	char buf[256];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (g_ConMsg) g_ConMsg("%s\n", buf);
+}
+
+#define SDL_KEYDOWN      0x300
 #define SDL_MOUSEMOTION  0x400
 #define SDL_TOUCH_MOUSEID 0xFFFFFFFFu
+#define SDL_SCANCODE_F7  64
+
+struct SDL_KeyboardEvent {
+	uint32_t type;
+	uint32_t timestamp;
+	uint32_t windowID;
+	uint8_t  state;
+	uint8_t  repeat;
+	uint8_t  padding2;
+	uint8_t  padding3;
+	int32_t  scancode;
+	int32_t  sym;
+	uint16_t mod;
+	uint32_t unused;
+};
 
 struct SDL_MouseMotionEvent {
 	uint32_t type;
@@ -50,6 +80,7 @@ struct SDL_MouseMotionEvent {
 union SDL_Event {
 	uint32_t type;
 	SDL_MouseMotionEvent motion;
+	SDL_KeyboardEvent    key;
 	uint8_t  padding[64];
 };
 
@@ -115,6 +146,116 @@ static void GetInterpolatedRawAccum(int& accumX, int& accumY, double frame_split
 
 	accumX = 0;
 	accumY = 0;
+}
+
+// Viewpunch remover (F7, on by default): patch PlayerRoughLandingEffects so the
+// predicted local punch is never written, and zero the decoded server punch.
+
+// The installer thread only locates and publishes; every write to game
+// memory happens on the main thread (SDL watch) so the toggle never races the
+// code it patches.
+static uint8_t* g_punchPatchSite     = nullptr;
+static uint8_t  g_punchPatchOriginal[2] = {0};
+static uint8_t  g_punchPatchNew[2]      = {0};
+static void**   g_punchProxySlot     = nullptr;
+static void*    g_punchProxyOriginal = nullptr;
+static bool     g_punchPending       = false;
+static bool     g_viewpunchRemoved   = true;
+
+static void ZeroVectorRecvProxy(const void* /*pData*/, void* /*pStruct*/, void* pOut)
+{
+	float* v = (float*)pOut;
+	v[0] = v[1] = v[2] = 0.0f;
+}
+
+static bool LocatePunchPatchSite()
+{
+	uintptr_t hit = FindPatternIn("client.so", SIG_RoughLanding_PunchStore);
+	if (!hit) return false;
+	uint8_t* site = (uint8_t*)(hit + OFF_RoughLanding_PatchSite);
+	uintptr_t limit = (uintptr_t)site + 0x100;
+	for (const auto& s : FindExecSegments("client.so"))
+		if ((uintptr_t)site >= s.start && (uintptr_t)site < s.end && limit > s.end) limit = s.end;
+	uintptr_t epilogue = ScanRange((uintptr_t)site, limit, ParseSig(SIG_RoughLanding_Epilogue));
+	if (!epilogue) return false;
+	epilogue += OFF_RoughLanding_Epilogue;
+	const intptr_t rel = (intptr_t)epilogue - (intptr_t)(site + 2);
+	if (rel < 0 || rel > 127) return false;
+	memcpy(g_punchPatchOriginal, site, 2);
+	g_punchPatchNew[0] = 0xEB;
+	g_punchPatchNew[1] = (uint8_t)rel;
+	__atomic_store_n(&g_punchPatchSite, site, __ATOMIC_RELEASE);
+	return true;
+}
+
+static uintptr_t LocatePunchAngleLiteral()
+{
+	const char needle[] = "m_vecPunchAngle";
+	for (const auto& seg : FindSegments("client.so", 'r')) {
+		const uint8_t* b = (const uint8_t*)seg.start;
+		const size_t n = sizeof(needle);
+		for (size_t i = 0; i + n <= seg.end - seg.start; ++i) {
+			if (memcmp(b + i, needle, n) == 0) return seg.start + i;
+		}
+	}
+	return 0;
+}
+
+static bool LocatePunchRecvProp(uintptr_t str)
+{
+	auto exec = FindExecSegments("client.so");
+	for (const auto& seg : FindSegments("client.so", 'w')) {
+		for (uintptr_t a = seg.start & ~(uintptr_t)7; a + RecvProp_SIZE <= seg.end; a += 8) {
+			if (*(uintptr_t*)a != str) continue;
+			if (*(int*)(a + OFF_RecvProp_m_RecvType) != DPT_Vector) continue;
+			if (*(int*)(a + OFF_RecvProp_m_nElements) != 1) continue;
+			uintptr_t proxy = *(uintptr_t*)(a + OFF_RecvProp_m_ProxyFn);
+			bool in_text = false;
+			for (const auto& x : exec) if (proxy >= x.start && proxy < x.end) in_text = true;
+			if (!in_text) continue;
+			g_punchProxyOriginal = (void*)proxy;
+			__atomic_store_n(&g_punchProxySlot, (void**)(a + OFF_RecvProp_m_ProxyFn), __ATOMIC_RELEASE);
+			return true;
+		}
+	}
+	return false;
+}
+
+// Main thread only. Applies the desired state to whichever halves resolved.
+static void ApplyViewpunch()
+{
+	uint8_t* site = __atomic_load_n(&g_punchPatchSite, __ATOMIC_ACQUIRE);
+	if (site) {
+		const uint8_t* bytes = g_viewpunchRemoved ? g_punchPatchNew : g_punchPatchOriginal;
+		if (memcmp(site, bytes, 2) != 0) {
+			if (mprotect_range((uintptr_t)site, 2, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+				memcpy(site, bytes, 2);
+				__builtin___clear_cache((char*)site, (char*)site + 2);
+				mprotect_range((uintptr_t)site, 2, PROT_READ | PROT_EXEC);
+			} else {
+				conmsg("Viewpunch: code patch failed (mprotect)");
+			}
+		}
+	}
+	void** slot = __atomic_load_n(&g_punchProxySlot, __ATOMIC_ACQUIRE);
+	if (slot) *slot = g_viewpunchRemoved ? (void*)&ZeroVectorRecvProxy : g_punchProxyOriginal;
+}
+
+// The .bss RecvProp table is a guarded static built when the ClientClass list
+// is first walked, after our sigs resolve, so keep polling for it.
+static void InstallViewpunchRemover()
+{
+	if (LocatePunchPatchSite()) __atomic_store_n(&g_punchPending, true, __ATOMIC_RELEASE);
+
+	const uintptr_t literal = LocatePunchAngleLiteral();
+	if (!literal) return;
+	for (int i = 0; i < 120 * 2; ++i) {
+		if (LocatePunchRecvProp(literal)) {
+			__atomic_store_n(&g_punchPending, true, __ATOMIC_RELEASE);
+			return;
+		}
+		usleep(500 * 1000);
+	}
 }
 
 typedef void (*CDownloadManager_UpdateProgressBar_t)(void* self);
@@ -267,6 +408,16 @@ static int RawInput2_SDLWatch(void* /*userdata*/, SDL_Event* ev)
 {
 	if (!ev) return 1;
 	if (__atomic_exchange_n(&g_installPending, false, __ATOMIC_ACQ_REL)) InstallCodeHooks();
+	if (__atomic_exchange_n(&g_punchPending, false, __ATOMIC_ACQ_REL)) ApplyViewpunch();
+	if (ev->type == SDL_KEYDOWN) {
+		if (ev->key.repeat == 0 && ev->key.scancode == SDL_SCANCODE_F7
+				&& (__atomic_load_n(&g_punchPatchSite, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_punchProxySlot, __ATOMIC_ACQUIRE))) {
+			g_viewpunchRemoved = !g_viewpunchRemoved;
+			ApplyViewpunch();
+			conmsg("Viewpunch: %d", g_viewpunchRemoved ? 0 : 1);
+		}
+		return 1;
+	}
 	if (ev->type != SDL_MOUSEMOTION) return 1;
 	if (ev->motion.which == SDL_TOUCH_MOUSEID) return 1;
 
@@ -523,6 +674,7 @@ static bool ResolvePlatFloatTime()
 	if (!h) return false;
 	void* sym = dlsym(h, "Plat_FloatTime");
 	if (!sym) sym = dlsym(h, "_Z13Plat_FloatTimev");
+	g_ConMsg = (ConMsg_t)dlsym(h, "_Z6ConMsgPKcz");
 	dlclose(h);
 	if (!sym) return false;
 	g_PlatFloatTime = (Plat_FloatTime_t)sym;
@@ -567,6 +719,7 @@ static void* InstallerThread(void* /*arg*/)
 	__atomic_store_n(&g_installPending, true, __ATOMIC_RELEASE);
 	addEventWatch(RawInput2_SDLWatch, nullptr);
 
+	InstallViewpunchRemover();
 	return nullptr;
 }
 

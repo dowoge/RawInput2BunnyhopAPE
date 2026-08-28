@@ -42,8 +42,9 @@ It should be possible to fix `Map differs` errors when you download from the ser
 ### Linux
 
 The `linux/` directory ships a 64-bit Linux port of the `m_rawinput 2`
-mouse interpolation and the download progress display. No autohop (the game
-has it natively now), no viewpunch remover, no fastdl. Modern CS:S on Linux runs `cstrike_linux64`, which is what the
+mouse interpolation, the viewpunch remover (`F7` toggle, on by default) and
+the download progress display. No autohop (the game has it natively now),
+no fastdl. Modern CS:S on Linux runs `cstrike_linux64`, which is what the
 preload targets.
 
 The Linux client has no `m_rawinput 2` code path at all: the cvar is only
@@ -82,7 +83,8 @@ LD_PRELOAD="/abs/path/to/librawinput2_linux.so" %command% -insecure
 
 The interpolation is on whenever the preload is loaded -- there's no in-game
 toggle. To disable, remove the `LD_PRELOAD=...` portion from your launch
-options.
+options. `F7` toggles the viewpunch remover (prints `Viewpunch: 0/1` to the
+console).
 
 **VAC warning:** `-insecure` is mandatory. Joining a VAC-secured server with
 the preload loaded will earn you a VAC ban. Only join servers the in-game

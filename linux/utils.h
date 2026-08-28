@@ -14,21 +14,22 @@ struct ModuleSegment {
 	std::string path;
 };
 
-// Returns all r-xp segments whose pathname contains `name_substr`.
-// Empty result means the module isn't loaded yet.
-inline std::vector<ModuleSegment> FindExecSegments(const char* name_substr)
+// The anonymous rw-p mapping directly after a module's last file-backed
+// segment is its .bss tail; report it under the module's path.
+inline std::vector<ModuleSegment> FindSegments(const char* name_substr, char need_perm)
 {
 	std::vector<ModuleSegment> out;
 	FILE* f = fopen("/proc/self/maps", "r");
 	if (!f) return out;
 
 	char line[1024];
+	uintptr_t module_end = 0;
+	std::string module_path;
 	while (fgets(line, sizeof(line), f)) {
 		uintptr_t s, e;
 		char perms[5] = {0};
 		int n = 0;
 		if (sscanf(line, "%lx-%lx %4s %*x %*s %*d %n", &s, &e, perms, &n) < 3) continue;
-		if (perms[0] != 'r' || perms[2] != 'x') continue;
 		if (n <= 0 || n >= (int)sizeof(line)) continue;
 
 		const char* path = line + n;
@@ -36,14 +37,34 @@ inline std::vector<ModuleSegment> FindExecSegments(const char* name_substr)
 		while (*path == ' ' || *path == '\t') ++path;
 		size_t plen = strlen(path);
 		while (plen && (path[plen-1] == '\n' || path[plen-1] == '\r' || path[plen-1] == ' ')) --plen;
-		if (!plen) continue;
 		std::string p(path, plen);
-		if (p.find(name_substr) == std::string::npos) continue;
 
+		bool is_module = plen && p.find(name_substr) != std::string::npos;
+		bool is_bss_tail = !plen && module_end && s == module_end && perms[1] == 'w'
+			&& (e - s) <= (16u << 20);
+		if (is_module) {
+			module_end = e;
+			module_path = p;
+		} else if (is_bss_tail) {
+			p = module_path;
+			module_end = 0;
+		} else {
+			module_end = 0;
+			continue;
+		}
+
+		if (perms[0] != 'r') continue;
+		if (need_perm == 'x' && perms[2] != 'x') continue;
+		if (need_perm == 'w' && perms[1] != 'w') continue;
 		out.push_back({s, e, std::move(p)});
 	}
 	fclose(f);
 	return out;
+}
+
+inline std::vector<ModuleSegment> FindExecSegments(const char* name_substr)
+{
+	return FindSegments(name_substr, 'x');
 }
 
 // Parse an IDA-style sig: "55 48 89 ? E5". '?' tokens match any byte.
@@ -74,8 +95,6 @@ inline ParsedSig ParseSig(const char* sig)
 	return p;
 }
 
-// Scan [start, end) for the parsed sig. Returns the address of the first match,
-// or 0 if not found.
 inline uintptr_t ScanRange(uintptr_t start, uintptr_t end, const ParsedSig& p)
 {
 	if (p.bytes.empty()) return 0;
@@ -95,7 +114,6 @@ inline uintptr_t ScanRange(uintptr_t start, uintptr_t end, const ParsedSig& p)
 	return 0;
 }
 
-// Convenience: scan all r-xp segments of a module for a sig string.
 inline uintptr_t FindPatternIn(const char* module_substr, const char* sig)
 {
 	auto segs = FindExecSegments(module_substr);

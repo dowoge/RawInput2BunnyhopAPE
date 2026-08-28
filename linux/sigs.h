@@ -14,6 +14,24 @@ static const int VT_CInput_CreateMove       = 3;  // (int sequence, bool active,
 static const int VT_CInput_ExtraMouseSample = 4;  // (bool active, float frametime)
 static const int VT_CInput_IN_SetSampleTime = 16; // (float frametime) -- host_frametime, once per render frame
 
+// client.so CGameMovement::PlayerRoughLandingEffects body, punch store; vtable index and field offsets wildcarded.
+static const char SIG_RoughLanding_PunchStore[] =
+	"FF 90 ? ? 00 00 49 8B 5C 24 08 66 0F EF C0 66 0F EF C9 F3 0F 5A 83 ? ? 00 00";
+static const size_t OFF_RoughLanding_PatchSite = 6;
+
+// Same body's epilogue, anchored on the preceding PITCH clamp compare
+// (RIP displacement wildcarded) so a neighbouring epilogue can't match.
+static const char SIG_RoughLanding_Epilogue[] = "0F 2F 05 ? ? ? ? 77 ? 48 83 C4 08 5B 41 5C 41 5D 5D C3";
+static const size_t OFF_RoughLanding_Epilogue = 9;
+static const size_t RecvProp_SIZE = 0x60;
+
+// DT_Local m_vecPunchAngle RecvProp: found by scanning writable segments
+// for a pointer to the "m_vecPunchAngle" string literal.
+static const ptrdiff_t OFF_RecvProp_m_RecvType  = 0x08; // int, DPT_Vector == 2
+static const ptrdiff_t OFF_RecvProp_m_ProxyFn   = 0x30; // RecvVarProxyFn
+static const ptrdiff_t OFF_RecvProp_m_nElements = 0x50; // int, 1
+static const int       DPT_Vector                = 2;
+
 // Download progress: five trampolined engine.so functions.
 
 // CDownloadManager::UpdateProgressBar; jz displacement wildcarded.
