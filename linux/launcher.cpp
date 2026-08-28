@@ -96,7 +96,8 @@ int main()
 	printf("==================================\n\n");
 	printf("m_rawinput 2 mouse interpolation (always on)\n");
 	printf("F7 toggles the viewpunch remover (on by default)\n");
-	printf("download progress shown in the loading bar\n\n");
+	printf("download progress shown in the loading bar\n");
+	printf("missing / differing maps fetched from fastdl.me\n\n");
 
 	if (!path_exists(so_path)) {
 		printf("WARNING: preload .so not found at:\n  %s\n\n", so_path);

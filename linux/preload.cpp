@@ -1,7 +1,8 @@
 // LD_PRELOAD payload for 64-bit CS:S on Linux: m_rawinput 2 mouse
-// interpolation, download progress, viewpunch remover. Always on; disable by
-// removing LD_PRELOAD from the launch options.
+// interpolation, download progress, viewpunch remover, fastdl.me map fixing.
+// Always on; disable by removing LD_PRELOAD from the launch options.
 
+#include <cctype>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdint>
@@ -15,6 +16,8 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <climits>
+#include <sys/stat.h>
 
 #include "utils.h"
 #include "sigs.h"
@@ -387,6 +390,307 @@ static void InstallDownloadProgress()
 	}
 }
 
+// fastdl.me map fixing. venus.fastdl.me/lump_checksums.csv maps a map's lump
+// MD5 (what SVC_ServerInfo carries) to the SHA1 main.fastdl.me stores it under.
+
+static void* ModuleHandle(const char* name_substr);
+
+typedef void*  (*curl_easy_init_t)(void);
+typedef int    (*curl_easy_setopt_t)(void*, int, ...);
+typedef int    (*curl_easy_perform_t)(void*);
+typedef void   (*curl_easy_cleanup_t)(void*);
+typedef int    (*curl_global_init_t)(long);
+#define CURL_GLOBAL_DEFAULT    3
+#define CURLOPT_TIMEOUT        13
+#define CURLOPT_CONNECTTIMEOUT 78
+#define CURLOPT_NOSIGNAL       99
+#define CURLOPT_WRITEDATA      10001
+#define CURLOPT_URL            10002
+#define CURLOPT_USERAGENT      10018
+#define CURLOPT_WRITEFUNCTION  20011
+#define CURLOPT_FAILONERROR    45
+#define CURLOPT_FOLLOWLOCATION 52
+
+static char* g_lumpChecksums = nullptr;
+
+static size_t CurlWriteToFile(char* data, size_t size, size_t n, void* f)
+{
+	return fwrite(data, size, n, (FILE*)f);
+}
+
+static bool CurlDownload(const char* url, const char* path)
+{
+	void* h = ModuleHandle("libcurl-gnutls");
+	if (!h) return false;
+	auto init    = (curl_easy_init_t)dlsym(h, "curl_easy_init");
+	auto setopt  = (curl_easy_setopt_t)dlsym(h, "curl_easy_setopt");
+	auto perform = (curl_easy_perform_t)dlsym(h, "curl_easy_perform");
+	auto cleanup = (curl_easy_cleanup_t)dlsym(h, "curl_easy_cleanup");
+	dlclose(h);
+	if (!init || !setopt || !perform || !cleanup) return false;
+
+	char tmp[PATH_MAX + 64];
+	snprintf(tmp, sizeof(tmp), "%s.part", path);
+	FILE* f = fopen(tmp, "wb");
+	if (!f) return false;
+	void* c = init();
+	bool ok = false;
+	if (c) {
+		setopt(c, CURLOPT_URL, url);
+		setopt(c, CURLOPT_WRITEFUNCTION, (void*)&CurlWriteToFile);
+		setopt(c, CURLOPT_WRITEDATA, (void*)f);
+		setopt(c, CURLOPT_FAILONERROR, 1L);
+		setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+		setopt(c, CURLOPT_USERAGENT, "RawInput2BunnyhopAPE");
+		setopt(c, CURLOPT_NOSIGNAL, 1L);
+		setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+		setopt(c, CURLOPT_TIMEOUT, 180L);
+		ok = perform(c) == 0;
+		cleanup(c);
+	}
+	fclose(f);
+	if (ok) ok = rename(tmp, path) == 0;
+	if (!ok) unlink(tmp);
+	return ok;
+}
+
+// curl_global_init is not thread-safe; do it here, before the fetch thread
+// exists and before the engine's first download.
+static void CurlGlobalInit()
+{
+	void* h = ModuleHandle("libcurl-gnutls");
+	if (!h) return;
+	auto global = (curl_global_init_t)dlsym(h, "curl_global_init");
+	if (global) global(CURL_GLOBAL_DEFAULT);
+	dlclose(h);
+}
+
+static void LoadLumpChecksums()
+{
+	const char* home = getenv("HOME");
+	if (!home) return;
+	char dir[PATH_MAX], path[PATH_MAX + 32];
+	snprintf(dir, sizeof(dir), "%s/.cache/rawinput2", home);
+	snprintf(path, sizeof(path), "%s/lump_checksums.csv", dir);
+	mkdir(dir, 0755);
+
+	struct stat st;
+	bool fresh = stat(path, &st) == 0 && labs((long)(time(nullptr) - st.st_mtime)) < 36 * 60 * 60;
+	if (!fresh && !CurlDownload("https://venus.fastdl.me/lump_checksums.csv", path) && stat(path, &st) != 0)
+		return;
+
+	FILE* f = fopen(path, "rb");
+	if (!f) return;
+	fseek(f, 0, SEEK_END);
+	long size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	char* buf = size > 0 ? (char*)calloc(size + 1, 1) : nullptr;
+	if (buf && fread(buf, 1, size, f) == (size_t)size)
+		__atomic_store_n(&g_lumpChecksums, buf, __ATOMIC_RELEASE);
+	else
+		free(buf);
+	fclose(f);
+}
+
+static void* LumpChecksumsThread(void*)
+{
+	LoadLumpChecksums();
+	return nullptr;
+}
+
+// Lines are "sha1,md5\n"; returns the 40-char sha1 for a lump MD5, or false.
+static bool LookupMapSha1(const unsigned char md5[16], char sha1[41])
+{
+	const char* csv = __atomic_load_n(&g_lumpChecksums, __ATOMIC_ACQUIRE);
+	if (!csv) return false;
+	char key[36];
+	for (int i = 0; i < 16; ++i) snprintf(key + i * 2, 3, "%02x", md5[i]);
+	key[32] = '\n'; key[33] = 0;
+	const char* found = strstr(csv, key);
+	if (!found && strchr(csv, '\r')) {
+		key[32] = '\r'; key[33] = '\n'; key[34] = 0;
+		found = strstr(csv, key);
+	}
+	if (!found || found - csv < 41 || found[-1] != ',') return false;
+	memcpy(sha1, found - 41, 40);
+	sha1[40] = 0;
+	return true;
+}
+
+// When the server's map differs from ours, the engine is told the map is named
+// after its fastdl.me SHA1 so it downloads that file instead of erroring; if the
+// server's own fastdl 404s on a map we lack, fetch it from fastdl.me by SHA1.
+// LevelInitPreEntity gets the real name back so per-map client scripts resolve.
+
+typedef bool (*CClientState_ProcessServerInfo_t)(void* self, char* msg);
+typedef bool (*MD5_MapFile_t)(unsigned char* md5, const char* mapfile);
+typedef void (*CDownloadManager_Queue_t)(void* self, const char* baseURL, const char* urlPath, const char* gamePath);
+typedef void (*CDownloadManager_SetupURLPath_t)(void* self, char* rc, const char* urlPath);
+typedef void (*CDownloadManager_OnDownloadError_t)(void* self, char* rc);
+typedef bool (*IsValidFileForTransfer_t)(const char* filename);
+typedef void (*CHLClient_LevelInitPreEntity_t)(void* self, const char* mapname);
+typedef void* (*CreateInterface_t)(const char* name, int* ret);
+
+static CClientState_ProcessServerInfo_t g_originalProcessServerInfo      = nullptr;
+static MD5_MapFile_t                    g_MD5_MapFile                    = nullptr;
+static CDownloadManager_Queue_t         g_originalQueue                  = nullptr;
+static IsValidFileForTransfer_t         g_originalIsValidFileForTransfer = nullptr;
+static CHLClient_LevelInitPreEntity_t   g_originalLevelInitPreEntity     = nullptr;
+static CDownloadManager_OnDownloadError_t g_originalOnDownloadError      = nullptr;
+static bool                             g_downloadVtableHooked           = false;
+
+static char g_serverMap[260]     = {0};
+static char g_matchingMapSha1[41] = {0};
+static bool g_hijackMap          = false;
+static bool g_requeuedAfterError = false;
+
+static const char FASTDL_BASE[] = "https://main.fastdl.me/";
+
+static bool IsBspPath(const char* path)
+{
+	size_t n = strlen(path);
+	return n > 9 && strncmp(path, "maps", 4) == 0 && (path[4] == '/' || path[4] == '\\')
+		&& strcasecmp(path + n - 4, ".bsp") == 0;
+}
+
+static const char* BaseName(const char* path)
+{
+	const char* a = strrchr(path, '/');
+	const char* b = strrchr(path, '\\');
+	const char* end = a > b ? a : b;
+	return end ? end + 1 : path;
+}
+
+static bool Hooked_ProcessServerInfo(void* self, char* msg)
+{
+	g_matchingMapSha1[0] = 0;
+	g_hijackMap = false;
+	g_requeuedAfterError = false;
+	char* mapName = *(char**)(msg + OFF_SVC_ServerInfo_m_szMapName);
+	snprintf(g_serverMap, sizeof(g_serverMap), "%s", mapName);
+
+	if (LookupMapSha1((const unsigned char*)(msg + OFF_SVC_ServerInfo_m_nMapMD5), g_matchingMapSha1)) {
+		char map[260];
+		unsigned char mine[16];
+		snprintf(map, sizeof(map), "maps/%s.bsp", mapName);
+		if (g_MD5_MapFile && g_MD5_MapFile(mine, map)
+				&& memcmp(mine, msg + OFF_SVC_ServerInfo_m_nMapMD5, 16) != 0) {
+			g_hijackMap = true;
+			strcpy(mapName, g_matchingMapSha1); // m_szMapNameBuffer[256]
+		}
+	}
+	return g_originalProcessServerInfo(self, msg);
+}
+
+static void Hooked_SetupURLPath(void* /*self*/, char* rc, const char* urlPath)
+{
+	char* dst = rc + OFF_RequestContext_urlPath;
+	snprintf(dst, 256, "%s%s", urlPath ? urlPath : rc + OFF_RequestContext_gamePath,
+		urlPath && rc[OFF_RequestContext_bIsBZ2] ? ".bz2" : "");
+}
+
+static void Hooked_OnDownloadError(void* self, char* rc)
+{
+	g_originalOnDownloadError(self, rc);
+	if (g_requeuedAfterError || !g_matchingMapSha1[0]) return;
+	if (!rc[OFF_RequestContext_bAsHTTP] || rc[OFF_RequestContext_bIsBZ2]) return;
+	const char* gamePath = rc + OFF_RequestContext_gamePath;
+	if (!IsBspPath(gamePath)) return;
+	g_requeuedAfterError = true;
+	char url[256];
+	snprintf(url, sizeof(url), "hashed/%s.bsp", g_matchingMapSha1);
+	g_originalQueue(self, FASTDL_BASE, url, gamePath);
+}
+
+static bool InstallDownloadVtableHooks(void* self)
+{
+	void** vt = *(void***)self;
+	uintptr_t first = (uintptr_t)&vt[VT_CDownloadManager_SetupURLPath];
+	uintptr_t last  = (uintptr_t)&vt[VT_CDownloadManager_OnDownloadError] + sizeof(void*);
+	int prot = PageProt(first) | PageProt(last - 1);
+	if (!mprotect_range(first, last - first, prot | PROT_WRITE)) return false;
+	g_originalOnDownloadError = (CDownloadManager_OnDownloadError_t)vt[VT_CDownloadManager_OnDownloadError];
+	vt[VT_CDownloadManager_SetupURLPath]    = (void*)&Hooked_SetupURLPath;
+	vt[VT_CDownloadManager_OnDownloadError] = (void*)&Hooked_OnDownloadError;
+	mprotect_range(first, last - first, prot);
+	return true;
+}
+
+static void Hooked_Queue(void* self, const char* baseURL, const char* urlPath, const char* gamePath)
+{
+	if (!g_downloadVtableHooked) g_downloadVtableHooked = InstallDownloadVtableHooks(self);
+	if (g_downloadVtableHooked && g_hijackMap && gamePath && IsBspPath(gamePath)) {
+		g_hijackMap = false;
+		char url[256], file[256];
+		snprintf(url, sizeof(url), "hashed/%s.bsp", g_matchingMapSha1);
+		snprintf(file, sizeof(file), "maps/%s.bsp", g_matchingMapSha1);
+		g_originalQueue(self, FASTDL_BASE, url, file);
+		return;
+	}
+	g_originalQueue(self, baseURL, urlPath, gamePath);
+}
+
+// The engine only accepts a 3-4 char extension after the first '.', which
+// rejects maps like "bhop_x.v2.bsp"; accept anything ending in .bsp instead.
+static bool Hooked_IsValidFileForTransfer(const char* filename)
+{
+	if (g_originalIsValidFileForTransfer(filename)) return true;
+	size_t n = strlen(filename);
+	if (n < 5 || n > 259 || strcasecmp(filename + n - 4, ".bsp") != 0) return false;
+	for (const char* c = BaseName(filename); *c; ++c)
+		if (!(isalnum((unsigned char)*c) || *c == '.' || *c == '_' || *c == '-')) return false;
+	// Re-run every other check with the extra dots in the basename masked.
+	char probe[260];
+	memcpy(probe, filename, n + 1);
+	for (char* c = (char*)BaseName(probe); c < probe + n - 4; ++c) if (*c == '.') *c = '_';
+	return g_originalIsValidFileForTransfer(probe);
+}
+
+static void Hooked_LevelInitPreEntity(void* self, const char* mapname)
+{
+	if (g_matchingMapSha1[0] && g_serverMap[0] && mapname
+			&& strncmp(BaseName(mapname), g_matchingMapSha1, 40) == 0)
+		mapname = BaseName(g_serverMap);
+	g_originalLevelInitPreEntity(self, mapname);
+}
+
+static void InstallFastdl()
+{
+	uintptr_t psi   = FindPatternIn("engine.so", SIG_CClientState_ProcessServerInfo);
+	uintptr_t md5   = FindPatternIn("engine.so", SIG_MD5_MapFile);
+	uintptr_t queue = FindPatternIn("engine.so", SIG_CDownloadManager_Queue);
+	uintptr_t valid = FindPatternIn("engine.so", SIG_IsValidFileForTransfer);
+	void* client = ModuleHandle("client.so");
+	CreateInterface_t create = client ? (CreateInterface_t)dlsym(client, "CreateInterface") : nullptr;
+	void* hlclient = create ? create("VClient017", nullptr) : nullptr;
+	if (client) dlclose(client);
+	if (!psi || !md5 || !queue || !valid || !hlclient) return;
+	g_MD5_MapFile = (MD5_MapFile_t)md5;
+
+	void** vt = *(void***)hlclient;
+	uintptr_t slot = (uintptr_t)&vt[VT_CHLClient_LevelInitPreEntity];
+	int prot = PageProt(slot);
+	if (!mprotect_range(slot, sizeof(void*), prot | PROT_WRITE)) return;
+	g_originalLevelInitPreEntity = (CHLClient_LevelInitPreEntity_t)vt[VT_CHLClient_LevelInitPreEntity];
+	vt[VT_CHLClient_LevelInitPreEntity] = (void*)&Hooked_LevelInitPreEntity;
+	mprotect_range(slot, sizeof(void*), prot);
+
+	InstallHook(valid, (uintptr_t)&Hooked_IsValidFileForTransfer,
+		HOOK_COPY_IsValidFileForTransfer, (void**)&g_originalIsValidFileForTransfer);
+	if (InstallHook(queue, (uintptr_t)&Hooked_Queue,
+			HOOK_COPY_CDownloadManager_Queue, (void**)&g_originalQueue))
+		InstallHook(psi, (uintptr_t)&Hooked_ProcessServerInfo,
+			HOOK_COPY_CClientState_ProcessServerInfo, (void**)&g_originalProcessServerInfo);
+
+	CurlGlobalInit();
+	pthread_t th;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	pthread_create(&th, &attr, LumpChecksumsThread, nullptr);
+	pthread_attr_destroy(&attr);
+}
+
 typedef void (*GetAccumulatedMouseDeltas_t)(void* self, float* mx, float* my);
 static GetAccumulatedMouseDeltas_t g_originalGetAccumulatedMouseDeltas = nullptr;
 static void Hooked_GetAccumulatedMouseDeltas(void* self, float* mx, float* my);
@@ -401,6 +705,7 @@ static void InstallCodeHooks()
 			HOOK_COPY_GetAccumulatedMouseDeltas, (void**)&g_originalGetAccumulatedMouseDeltas))
 		return;
 	InstallDownloadProgress();
+	InstallFastdl();
 }
 
 // Runs synchronously inside SDL_PumpEvents for every event, before any consumer.

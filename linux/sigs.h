@@ -73,3 +73,42 @@ static const char SIG_BZ2_bzread[] =
 	"83 BF E8 13 00 00 04 74 ? 55 49 89 F8 89 D1 48 89 F2 48 89 E5 4C 89 C6 48 83 EC 10 48 8D 7D FC";
 // copy 7: cmp dword [rdi+0x13E8], 4
 static const size_t HOOK_COPY_BZ2_bzread = 7;
+
+// fastdl.me map fixing.
+
+// engine.so CClientState::ProcessServerInfo(this, SVC_ServerInfo*); call rel32 wildcarded.
+static const char SIG_CClientState_ProcessServerInfo[] =
+	"55 48 89 E5 41 55 41 54 49 89 FC 53 48 89 F3 48 83 EC 08 E8 ? ? ? ? 48 89 DE 4C 89 E7";
+// copy 6: push rbp; mov rbp,rsp; push r13
+static const size_t HOOK_COPY_CClientState_ProcessServerInfo = 6;
+
+// SVC_ServerInfo (64-bit).
+static const ptrdiff_t OFF_SVC_ServerInfo_m_nMapMD5   = 0x38; // MD5Value_t, map lumps
+static const ptrdiff_t OFF_SVC_ServerInfo_m_szMapName = 0x60; // const char*
+
+// engine.so MD5_MapFile(MD5Value_t* out, const char* mapfile).
+static const char SIG_MD5_MapFile[] =
+	"55 48 89 E5 41 57 41 56 41 55 41 54 49 89 F4 53 48 8D B5 58 F7 FF FF";
+
+// engine.so CDownloadManager::Queue(this, baseURL, urlPath, gamePath).
+static const char SIG_CDownloadManager_Queue[] =
+	"55 48 89 E5 41 57 49 89 D7 41 56 49 89 FE 48 89 CF 41 55 49 89 F5 41 54 49 89 CC 53";
+// copy 6: push rbp; mov rbp,rsp; push r15
+static const size_t HOOK_COPY_CDownloadManager_Queue = 6;
+
+// CDownloadManager vtable. QueueInternal devirtualises slot 4 by comparing
+// against the default, so the slot must be swapped, not the function patched.
+static const int VT_CDownloadManager_SetupURLPath    = 4; // (RequestContext_t*, const char* urlPath) -- default ignores urlPath
+static const int VT_CDownloadManager_OnDownloadError = 9; // (RequestContext_t*), empty by default
+static const ptrdiff_t OFF_RequestContext_bIsBZ2   = 0x002;
+static const ptrdiff_t OFF_RequestContext_urlPath  = 0x114;
+static const ptrdiff_t OFF_RequestContext_gamePath = 0x314;
+
+// engine.so IsValidFileForTransfer(const char*); call rel32 wildcarded.
+static const char SIG_IsValidFileForTransfer[] =
+	"55 48 89 E5 41 55 49 89 FD 41 54 53 48 81 EC 18 01 00 00 E8 ? ? ? ? 3D 03 01 00 00";
+// copy 6: push rbp; mov rbp,rsp; push r13
+static const size_t HOOK_COPY_IsValidFileForTransfer = 6;
+
+// client.so CHLClient vtable, reached via CreateInterface("VClient017").
+static const int VT_CHLClient_LevelInitPreEntity = 5; // (const char* mapname)

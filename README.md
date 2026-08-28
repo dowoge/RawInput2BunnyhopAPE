@@ -42,9 +42,10 @@ It should be possible to fix `Map differs` errors when you download from the ser
 ### Linux
 
 The `linux/` directory ships a 64-bit Linux port of the `m_rawinput 2`
-mouse interpolation, the viewpunch remover (`F7` toggle, on by default) and
-the download progress display. No autohop (the game has it natively now),
-no fastdl. Modern CS:S on Linux runs `cstrike_linux64`, which is what the
+mouse interpolation, the viewpunch remover (`F7` toggle, on by default), the
+download progress display and the fastdl.me map fixing (see the table above;
+`lump_checksums.csv` is cached in `~/.cache/rawinput2/`). No autohop (the
+game has it natively now). Modern CS:S on Linux runs `cstrike_linux64`, which is what the
 preload targets.
 
 The Linux client has no `m_rawinput 2` code path at all: the cvar is only
