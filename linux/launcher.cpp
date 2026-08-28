@@ -94,7 +94,8 @@ int main()
 
 	printf("RawInput2BunnyhopAPE -- Linux port\n");
 	printf("==================================\n\n");
-	printf("m_rawinput 2 mouse interpolation (always on)\n\n");
+	printf("m_rawinput 2 mouse interpolation (always on)\n");
+	printf("download progress shown in the loading bar\n\n");
 
 	if (!path_exists(so_path)) {
 		printf("WARNING: preload .so not found at:\n  %s\n\n", so_path);

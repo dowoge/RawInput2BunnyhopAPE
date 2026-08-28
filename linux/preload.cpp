@@ -1,6 +1,6 @@
 // LD_PRELOAD payload for 64-bit CS:S on Linux: m_rawinput 2 mouse
-// interpolation. Always on; disable by removing LD_PRELOAD from the launch
-// options.
+// interpolation and download progress. Always on; disable by removing
+// LD_PRELOAD from the launch options.
 
 #include <cerrno>
 #include <cstdint>
@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cwchar>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <pthread.h>
@@ -116,6 +117,135 @@ static void GetInterpolatedRawAccum(int& accumX, int& accumY, double frame_split
 	accumY = 0;
 }
 
+typedef void (*CDownloadManager_UpdateProgressBar_t)(void* self);
+typedef void (*CEngineVGui_UpdateCustomProgressBar_t)(const wchar_t* desc, float progress);
+typedef void (*CEngineVGui_UpdateCustomProgressBarThunk_t)(void* self, const wchar_t* desc, float progress);
+typedef void (*DownloadCache_PersistToDisk_t)(void* self, void* rc);
+typedef bool (*DecompressBZipToDisk_t)(const char* out, const char* src, char* data, int bytes);
+typedef int  (*BZ2_bzread_t)(void* bzfile, void* buf, int len);
+
+static CDownloadManager_UpdateProgressBar_t   g_originalUpdateProgressBar       = nullptr;
+static CEngineVGui_UpdateCustomProgressBar_t  g_originalUpdateCustomProgressBar = nullptr;
+static CEngineVGui_UpdateCustomProgressBarThunk_t g_UpdateCustomProgressBarThunk = nullptr;
+static DownloadCache_PersistToDisk_t          g_originalPersistToDisk           = nullptr;
+static DecompressBZipToDisk_t                 g_originalDecompressBZipToDisk    = nullptr;
+static BZ2_bzread_t                           g_originalBZ2_bzread              = nullptr;
+
+static int  g_downloadBytesCurrent = 0;
+static int  g_downloadBytesTotal   = 0;
+static bool g_downloadShowBytes    = false;
+static long long g_bz2BytesTotal   = 0;
+static int  g_bz2Reads             = 0;
+
+// Via the vtable thunk so its GameUI null check still guards the body.
+static void ProgressBar(const wchar_t* desc, float progress)
+{
+	g_downloadBytesCurrent = g_downloadBytesTotal = 0;
+	g_downloadShowBytes = false;
+	g_UpdateCustomProgressBarThunk(nullptr, desc, progress);
+}
+
+static void Hooked_UpdateProgressBar(void* self)
+{
+	char* rc = *(char**)((char*)self + OFF_CDownloadManager_m_activeRequest);
+	if (rc && rc[OFF_RequestContext_bAsHTTP]) {
+		g_downloadBytesCurrent = *(int*)(rc + OFF_RequestContext_nBytesCurrent);
+		g_downloadBytesTotal   = *(int*)(rc + OFF_RequestContext_nBytesTotal);
+		g_downloadShowBytes    = true;
+	}
+	g_originalUpdateProgressBar(self);
+}
+
+static void Hooked_UpdateCustomProgressBar(const wchar_t* desc, float progress)
+{
+	wchar_t buf[256];
+	if (g_downloadShowBytes && desc) {
+		const wchar_t prefix[] = L"Downloading ";
+		const size_t prefix_len = sizeof(prefix) / sizeof(prefix[0]) - 1;
+		if (wcsncmp(desc, prefix, prefix_len) == 0) desc += prefix_len;
+		if (wcsncmp(desc, L"maps/", 5) == 0) desc += 5;
+		int n = swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"DL %ls (%dM/%dM)", desc,
+			g_downloadBytesCurrent / 1024 / 1024, g_downloadBytesTotal / 1024 / 1024);
+		if (n >= 0) desc = buf;
+		if (g_downloadBytesTotal > 0) {
+			float p = (float)g_downloadBytesCurrent / (float)g_downloadBytesTotal;
+			progress = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
+		}
+	}
+	g_originalUpdateCustomProgressBar(desc, progress);
+	g_downloadBytesCurrent = g_downloadBytesTotal = 0;
+	g_downloadShowBytes = false;
+}
+
+static void Hooked_PersistToDisk(void* self, void* rc)
+{
+	ProgressBar(L"Writing to disk...", 0.0f);
+	g_originalPersistToDisk(self, rc);
+	ProgressBar(L"Done...", 1.0f);
+}
+
+static bool Hooked_DecompressBZipToDisk(const char* out, const char* src, char* data, int bytes)
+{
+	ProgressBar(L"Decompressing bz2 to disk...", 0.0f);
+	g_bz2BytesTotal = g_bz2Reads = 0;
+	return g_originalDecompressBZipToDisk(out, src, data, bytes);
+}
+
+static int Hooked_BZ2_bzread(void* bzfile, void* buf, int len)
+{
+	int n = g_originalBZ2_bzread(bzfile, buf, len);
+	if (n > 0) {
+		g_bz2BytesTotal += n;
+		if ((++g_bz2Reads % 16) == 0) {
+			wchar_t msg[256];
+			if (swprintf(msg, sizeof(msg) / sizeof(msg[0]), L"Bytes uncompressed and written: %lldM",
+					g_bz2BytesTotal / 1024 / 1024) >= 0)
+				ProgressBar(msg, 0.0f);
+		}
+	} else if (n == 0) {
+		ProgressBar(L"Done...", 1.0f);
+	} else {
+		ProgressBar(L"bz2 error", 0.0f);
+	}
+	return n;
+}
+
+static void InstallDownloadProgress()
+{
+	struct { const char* sig; size_t copy; void* hook; void** original; } hooks[] = {
+		{ SIG_CEngineVGui_UpdateCustomProgressBar,
+		  HOOK_COPY_CEngineVGui_UpdateCustomProgressBar, (void*)&Hooked_UpdateCustomProgressBar,
+		  (void**)&g_originalUpdateCustomProgressBar },
+		{ SIG_CDownloadManager_UpdateProgressBar,
+		  HOOK_COPY_CDownloadManager_UpdateProgressBar, (void*)&Hooked_UpdateProgressBar,
+		  (void**)&g_originalUpdateProgressBar },
+		{ SIG_DownloadCache_PersistToDisk,
+		  HOOK_COPY_DownloadCache_PersistToDisk, (void*)&Hooked_PersistToDisk,
+		  (void**)&g_originalPersistToDisk },
+		{ SIG_DecompressBZipToDisk,
+		  HOOK_COPY_DecompressBZipToDisk, (void*)&Hooked_DecompressBZipToDisk,
+		  (void**)&g_originalDecompressBZipToDisk },
+		{ SIG_BZ2_bzread,
+		  HOOK_COPY_BZ2_bzread, (void*)&Hooked_BZ2_bzread,
+		  (void**)&g_originalBZ2_bzread },
+	};
+
+	uintptr_t thunk = FindPatternIn("engine.so", SIG_CEngineVGui_UpdateCustomProgressBar_Thunk);
+	if (!thunk) return;
+	g_UpdateCustomProgressBarThunk = (CEngineVGui_UpdateCustomProgressBarThunk_t)thunk;
+
+	const size_t hook_count = sizeof(hooks) / sizeof(hooks[0]);
+	uintptr_t targets[sizeof(hooks) / sizeof(hooks[0])];
+	for (size_t i = 0; i < hook_count; ++i) {
+		targets[i] = FindPatternIn("engine.so", hooks[i].sig);
+		if (!targets[i]) return;
+	}
+	// Progress-bar hook first: every other hook calls into it.
+	for (size_t i = 0; i < hook_count; ++i) {
+		if (!InstallHook(targets[i], (uintptr_t)hooks[i].hook, hooks[i].copy, hooks[i].original)) return;
+	}
+}
+
 typedef void (*GetAccumulatedMouseDeltas_t)(void* self, float* mx, float* my);
 static GetAccumulatedMouseDeltas_t g_originalGetAccumulatedMouseDeltas = nullptr;
 static void Hooked_GetAccumulatedMouseDeltas(void* self, float* mx, float* my);
@@ -129,6 +259,7 @@ static void InstallCodeHooks()
 	if (!InstallHook(g_clientTarget, (uintptr_t)&Hooked_GetAccumulatedMouseDeltas,
 			HOOK_COPY_GetAccumulatedMouseDeltas, (void**)&g_originalGetAccumulatedMouseDeltas))
 		return;
+	InstallDownloadProgress();
 }
 
 // Runs synchronously inside SDL_PumpEvents for every event, before any consumer.
