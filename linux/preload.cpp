@@ -48,7 +48,8 @@ static void conmsg(const char* fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	if (g_ConMsg) g_ConMsg("%s\n", buf);
+	if (g_ConMsg) g_ConMsg("[rawinput2] %s\n", buf);
+	fprintf(stderr, "[rawinput2] %s\n", buf);
 }
 
 #define SDL_KEYDOWN      0x300
@@ -702,8 +703,11 @@ static bool      g_installPending = false;
 static void InstallCodeHooks()
 {
 	if (!InstallHook(g_clientTarget, (uintptr_t)&Hooked_GetAccumulatedMouseDeltas,
-			HOOK_COPY_GetAccumulatedMouseDeltas, (void**)&g_originalGetAccumulatedMouseDeltas))
+			HOOK_COPY_GetAccumulatedMouseDeltas, (void**)&g_originalGetAccumulatedMouseDeltas)) {
+		conmsg("mouse hook FAILED to install");
 		return;
+	}
+	conmsg("mouse interpolation hook installed");
 	InstallDownloadProgress();
 	InstallFastdl();
 }
@@ -1018,7 +1022,11 @@ static void* InstallerThread(void* /*arg*/)
 		usleep(100 * 1000);
 	}
 
-	if (!g_PlatFloatTime || !addEventWatch || !client_target) return nullptr;
+	if (!g_PlatFloatTime || !addEventWatch || !client_target) {
+		conmsg("install FAILED: tier0=%d sdl=%d client_sig=%d",
+			g_PlatFloatTime != nullptr, addEventWatch != nullptr, client_target != 0);
+		return nullptr;
+	}
 
 	g_clientTarget = client_target;
 	__atomic_store_n(&g_installPending, true, __ATOMIC_RELEASE);
@@ -1049,6 +1057,7 @@ __attribute__((constructor))
 static void rawinput2_ctor()
 {
 	if (!is_game_process()) return;
+	fprintf(stderr, "[rawinput2] preloaded into game process\n");
 
 	pthread_t th;
 	pthread_attr_t attr;
