@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <unistd.h>
+#include <sys/mman.h>
 
 struct ModuleSegment {
 	uintptr_t start;
@@ -124,4 +126,34 @@ inline uintptr_t FindPatternIn(const char* module_substr, const char* sig)
 		if (hit) return hit;
 	}
 	return 0;
+}
+
+// A vtable can share its page with writable data (RELRO ends mid-page), so
+// restore what the page had rather than assuming read-only.
+inline int PageProt(uintptr_t addr)
+{
+	int prot = PROT_READ;
+	FILE* f = fopen("/proc/self/maps", "r");
+	if (!f) return prot;
+	char line[1024];
+	while (fgets(line, sizeof(line), f)) {
+		uintptr_t s, e;
+		char perms[5] = {0};
+		if (sscanf(line, "%lx-%lx %4s", &s, &e, perms) < 3) continue;
+		if (addr < s || addr >= e) continue;
+		prot = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) | (perms[2] == 'x' ? PROT_EXEC : 0);
+		break;
+	}
+	fclose(f);
+	return prot;
+}
+
+inline bool mprotect_range(uintptr_t start, size_t len, int prot)
+{
+	const long page_size = sysconf(_SC_PAGESIZE);
+	uintptr_t page_start = start & ~(uintptr_t)(page_size - 1);
+	size_t total = (start + len) - page_start;
+	size_t pad = total % page_size;
+	if (pad) total += (page_size - pad);
+	return mprotect((void*)page_start, total, prot) == 0;
 }

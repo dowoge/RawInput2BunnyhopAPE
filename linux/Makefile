@@ -31,8 +31,8 @@ EXE_FLAGS := -m64 \
 
 all: $(SO_NAME) $(EXE_NAME)
 
-$(SO_NAME): preload.cpp utils.h sigs.h preload.ver
-	$(CXX) $(CXXFLAGS) -fPIC preload.cpp -o $@ $(SO_FLAGS)
+$(SO_NAME): preload.cpp teleport_predict.cpp teleport_predict.h prediction.h trigger_sim.h bsp_lzma.h utils.h sigs.h preload.ver
+	$(CXX) $(CXXFLAGS) -fPIC preload.cpp teleport_predict.cpp -o $@ $(SO_FLAGS)
 
 $(EXE_NAME): launcher.cpp
 	$(CXX) $(CXXFLAGS) launcher.cpp -o $@ $(EXE_FLAGS)

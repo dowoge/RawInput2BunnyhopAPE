@@ -112,3 +112,21 @@ static const size_t HOOK_COPY_IsValidFileForTransfer = 6;
 
 // client.so CHLClient vtable, reached via CreateInterface("VClient017").
 static const int VT_CHLClient_LevelInitPreEntity = 5; // (const char* mapname)
+
+// Trigger prediction.
+
+// client.so CreateInterface("GameMovement001"); Itanium ABI puts two
+// destructor slots first, so ProcessMovement is slot 2 (1 on MSVC).
+static const int VT_IGameMovement_ProcessMovement = 2; // (CBasePlayer*, CMoveData*)
+
+// engine.so CreateInterface("VEngineClient014").
+static const int VT_IVEngineClient_GetViewAngles    = 19;
+static const int VT_IVEngineClient_SetViewAngles    = 20;
+static const int VT_IVEngineClient_IsInGame         = 26;
+static const int VT_IVEngineClient_GetGameDirectory = 35;
+static const int VT_IVEngineClient_GetLevelName     = 51;
+
+// CMoveData (64-bit): m_flMaxSpeed is at 0x3C, m_vecVelocity follows m_flClientMaxSpeed.
+static const ptrdiff_t OFF_CMoveData_m_bFirstRunOfFunctions = 0x00; // bit 0
+static const ptrdiff_t OFF_CMoveData_m_vecVelocity          = 0x44;
+static const ptrdiff_t OFF_CMoveData_m_vecAbsOrigin         = 0x9C;

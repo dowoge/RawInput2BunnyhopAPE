@@ -1,5 +1,6 @@
 // LD_PRELOAD payload for 64-bit CS:S on Linux: m_rawinput 2 mouse
-// interpolation, download progress, viewpunch remover, fastdl.me map fixing.
+// interpolation, download progress, viewpunch remover, fastdl.me map fixing,
+// client-side trigger prediction.
 // Always on; disable by removing LD_PRELOAD from the launch options.
 
 #include <cctype>
@@ -21,10 +22,9 @@
 
 #include "utils.h"
 #include "sigs.h"
+#include "teleport_predict.h"
 
 static bool InstallHook(uintptr_t target, uintptr_t hook, size_t copy_size, void** original);
-static bool mprotect_range(uintptr_t start, size_t len, int prot);
-static int  PageProt(uintptr_t addr);
 
 typedef double (*Plat_FloatTime_t)();
 static Plat_FloatTime_t g_PlatFloatTime = nullptr;
@@ -56,6 +56,7 @@ static void conmsg(const char* fmt, ...)
 #define SDL_MOUSEMOTION  0x400
 #define SDL_TOUCH_MOUSEID 0xFFFFFFFFu
 #define SDL_SCANCODE_F7  64
+#define SDL_SCANCODE_F8  65
 
 struct SDL_KeyboardEvent {
 	uint32_t type;
@@ -697,6 +698,7 @@ static GetAccumulatedMouseDeltas_t g_originalGetAccumulatedMouseDeltas = nullptr
 static void Hooked_GetAccumulatedMouseDeltas(void* self, float* mx, float* my);
 static uintptr_t g_clientTarget  = 0;
 static bool      g_installPending = false;
+static bool      g_teleportPredictReady = false;
 
 // Code patches land from the main thread, which is provably not inside any
 // of the patched functions while it is pumping SDL events.
@@ -710,6 +712,8 @@ static void InstallCodeHooks()
 	conmsg("mouse interpolation hook installed");
 	InstallDownloadProgress();
 	InstallFastdl();
+	g_teleportPredictReady = tp::Init() && tp::Attach();
+	if (!g_teleportPredictReady) conmsg("trigger prediction: unavailable (init failed)");
 }
 
 // Runs synchronously inside SDL_PumpEvents for every event, before any consumer.
@@ -724,6 +728,15 @@ static int RawInput2_SDLWatch(void* /*userdata*/, SDL_Event* ev)
 			g_viewpunchRemoved = !g_viewpunchRemoved;
 			ApplyViewpunch();
 			conmsg("Viewpunch: %d", g_viewpunchRemoved ? 0 : 1);
+		}
+		if (ev->key.repeat == 0 && ev->key.scancode == SDL_SCANCODE_F8) {
+			if (g_teleportPredictReady) {
+				bool on = tp::Toggle();
+				conmsg("Trigger prediction: %s (%d triggers%s)", on ? "ON" : "OFF",
+					tp::LoadedCount(), tp::Ready() ? "" : ", offsets unverified");
+			} else {
+				conmsg("Trigger prediction: unavailable (init failed)");
+			}
 		}
 		return 1;
 	}
@@ -849,36 +862,6 @@ static void Hooked_GetAccumulatedMouseDeltas(void* self, float* mx, float* my)
 static long g_pageSize = 0;
 
 static const size_t JMP_PATCH_SIZE = 5;
-
-// A vtable can share its page with writable data (RELRO ends mid-page), so
-// restore what the page had rather than assuming read-only.
-static int PageProt(uintptr_t addr)
-{
-	int prot = PROT_READ;
-	FILE* f = fopen("/proc/self/maps", "r");
-	if (!f) return prot;
-	char line[1024];
-	while (fgets(line, sizeof(line), f)) {
-		uintptr_t s, e;
-		char perms[5] = {0};
-		if (sscanf(line, "%lx-%lx %4s", &s, &e, perms) < 3) continue;
-		if (addr < s || addr >= e) continue;
-		prot = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) | (perms[2] == 'x' ? PROT_EXEC : 0);
-		break;
-	}
-	fclose(f);
-	return prot;
-}
-
-static bool mprotect_range(uintptr_t start, size_t len, int prot)
-{
-	if (g_pageSize == 0) g_pageSize = sysconf(_SC_PAGESIZE);
-	uintptr_t page_start = start & ~(uintptr_t)(g_pageSize - 1);
-	size_t total = (start + len) - page_start;
-	size_t pad = total % g_pageSize;
-	if (pad) total += (g_pageSize - pad);
-	return mprotect((void*)page_start, total, prot) == 0;
-}
 
 // jmp rel32 only reaches +-2GB, so the stub has to live near the target.
 static uint8_t* AllocNearPage(uintptr_t target)
@@ -1006,6 +989,15 @@ static SDL_AddEventWatch_t ResolveSDLAddEventWatch()
 	return fn;
 }
 
+// Same guarded-static timing as the punch RecvProp above.
+static void InstallTriggerPredictionNetvars()
+{
+	for (int i = 0; i < 120 * 2; ++i) {
+		if (tp::ResolveNetvars()) return;
+		usleep(500 * 1000);
+	}
+}
+
 static void* InstallerThread(void* /*arg*/)
 {
 	uintptr_t client_target = 0;
@@ -1033,6 +1025,7 @@ static void* InstallerThread(void* /*arg*/)
 	addEventWatch(RawInput2_SDLWatch, nullptr);
 
 	InstallViewpunchRemover();
+	InstallTriggerPredictionNetvars();
 	return nullptr;
 }
 

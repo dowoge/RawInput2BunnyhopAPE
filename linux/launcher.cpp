@@ -96,6 +96,7 @@ int main()
 	printf("==================================\n\n");
 	printf("m_rawinput 2 mouse interpolation (always on)\n");
 	printf("F7 toggles the viewpunch remover (on by default)\n");
+	printf("F8 toggles client-side trigger prediction (on by default)\n");
 	printf("download progress shown in the loading bar\n");
 	printf("missing / differing maps fetched from fastdl.me\n\n");
 
